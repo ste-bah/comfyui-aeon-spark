@@ -97,6 +97,7 @@ echo "${C}━━━ 2/5: Refresh local scripts & workflows from GitHub ━━━
 mkdir -p .sync-old
 cp -a workflows .sync-old/workflows 2>/dev/null || true
 cp -a download_models.py .sync-old/download_models.py 2>/dev/null || true
+cp -a models.yaml .sync-old/models.yaml 2>/dev/null || true
 
 IS_GIT=0
 if [ -d .git ]; then
@@ -139,7 +140,7 @@ if [ "$IS_GIT" = "0" ]; then
     echo "  no git repo here — fetching the runtime files from GitHub directly"
     TMPDIR=$(mktemp -d)
     git clone --depth=1 --quiet "$REPO_URL" "$TMPDIR/repo"
-    for item in workflows download_models.py setup.sh sync.sh; do
+    for item in workflows download_models.py models.yaml setup.sh sync.sh; do
         if [ -e "$TMPDIR/repo/$item" ]; then
             rm -rf "./$item"
             cp -a "$TMPDIR/repo/$item" "./$item"
@@ -147,7 +148,7 @@ if [ "$IS_GIT" = "0" ]; then
     done
     chmod +x setup.sh sync.sh 2>/dev/null || true
     rm -rf "$TMPDIR"
-    echo "${G}✓${D} runtime files refreshed (workflows, download_models.py, setup.sh, sync.sh)"
+    echo "${G}✓${D} runtime files refreshed (workflows, download_models.py, models.yaml, setup.sh, sync.sh)"
 fi
 
 # ── Step 3: compute the diff ────────────────────────────────────────────────

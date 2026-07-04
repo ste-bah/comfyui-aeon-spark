@@ -213,6 +213,7 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 # -----------------------------------------------------------------------------
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY download_models.py /usr/local/bin/download_models.py
+COPY models.yaml /usr/local/bin/models.yaml
 COPY workflows /opt/default_workflows
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/download_models.py
 

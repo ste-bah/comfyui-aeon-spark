@@ -124,6 +124,8 @@ services:
 
       # Toggle the auto-download flow on first start
       SKIP_MODEL_DOWNLOAD: "${SKIP_MODEL_DOWNLOAD:-0}"
+      MODEL_PROFILE: "${MODEL_PROFILE:-legacy}"
+      MODEL_GROUPS: "${MODEL_GROUPS:-}"
       SKIP_ABLITERATED: "${SKIP_ABLITERATED:-0}"
       FORCE_MODEL_DOWNLOAD: "${FORCE_MODEL_DOWNLOAD:-0}"
 
@@ -143,6 +145,7 @@ services:
       - ./workspace:/workspace/ComfyUI
       - ./entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
       - ./download_models.py:/usr/local/bin/download_models.py:ro
+      - ./models.yaml:/usr/local/bin/models.yaml:ro
 
     shm_size: "32gb"
     ipc: host

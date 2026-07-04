@@ -1,23 +1,57 @@
 #!/usr/bin/env python
 """
-Download Flux 2 Dev + LTX 2.3 (full) + abliterated text encoders into the
-ComfyUI persistent workspace. Resumable via huggingface_hub.
+Manifest-driven model downloader for comfyui-aeon-spark.
 
-Models targeted for DGX Spark unified memory (BF16 default, NVFP4 alts cached
-for users that want max throughput on the sm_121a CUTLASS NVFP4 path).
+Models are declared in models.yaml (next to this script by default) with
+group / precision / size metadata. Profiles select which subset to fetch:
+
+    legacy   exact parity with the original 35-item set        (default)
+    spark    DGX Spark optimal: NVFP4/FP8 first, no BF16 twins,
+             plus the 2026 additions (Z-Image-Turbo, Qwen-Image)
+    latest   legacy + 2026 additions, all precisions
+    minimal  one model per modality, smallest footprint
+
+Selection:
+    --profile spark                (or env MODEL_PROFILE=spark)
+    --groups "+wan-video,-ace-audio"   add/remove groups on top of a profile
+                                   (or env MODEL_GROUPS=...)
+
+Improvements over the original script:
+    * preflight disk-space check (sum of pending sizes vs free space) —
+      refuses to start a download that cannot fit; override with --force
+    * post-download size verification against HF file metadata (catches
+      truncated files the old "exists and size > 0" check waved through)
+    * hardlink dedupe for files workflows expect under two names
+    * --validate: check every selected entry exists on HF (metadata only,
+      nothing downloaded) — use before enabling experimental groups
+    * --list / --dry-run: show the plan and per-group sizes, do nothing
+    * machine-readable manifest_status.json written into the workspace
+
+Back-compat: --workspace and --skip-abliterated behave as before;
+SKIP_ABLITERATED=1 is still honoured. Resume/idempotency semantics are
+unchanged (files already present are skipped).
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import shutil
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import get_hf_file_metadata, hf_hub_url
 from huggingface_hub.utils import HfHubHTTPError
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    print("[downloader] PyYAML is required (pip install pyyaml)", file=sys.stderr)
+    sys.exit(2)
 
 logging.basicConfig(
     format="\033[1;35m[downloader]\033[0m %(message)s",
@@ -28,272 +62,145 @@ log = logging.getLogger("downloader")
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "180")
 
-
-# Each entry: (repo_id, repo_filepath, local_subdir, friendly_name [, local_filename])
-# - local_subdir is relative to <workspace>/models/  (may contain '/' for nested dirs)
-# - local_filename, if present, renames the file at the destination
-PRIMARY_FILES: list[tuple] = [
-    # ---------- Flux 2 Dev (Comfy-Org pre-split, ComfyUI-native) ----------
-    (
-        "Comfy-Org/flux2-dev",
-        "split_files/diffusion_models/flux2_dev_fp8mixed.safetensors",
-        "diffusion_models",
-        "Flux 2 Dev DiT (fp8 mixed, 35.5GB)",
-    ),
-    (
-        "Comfy-Org/flux2-dev",
-        "split_files/vae/flux2-vae.safetensors",
-        "vae",
-        "Flux 2 VAE",
-    ),
-    (
-        "Comfy-Org/flux2-dev",
-        "split_files/text_encoders/mistral_3_small_flux2_bf16.safetensors",
-        "text_encoders",
-        "Flux 2 Mistral-3 Small text encoder (BF16, 35.6GB — best quality)",
-    ),
-    (
-        "Comfy-Org/flux2-dev",
-        "split_files/text_encoders/mistral_3_small_flux2_fp4_mixed.safetensors",
-        "text_encoders",
-        "Flux 2 Mistral-3 Small text encoder (NVFP4 mixed, 12.3GB — sm_121a accelerated)",
-    ),
-    (
-        "Comfy-Org/flux2-dev",
-        "split_files/loras/Flux2TurboComfyv2.safetensors",
-        "loras",
-        "Flux 2 Turbo LoRA (fewer-step inference)",
-    ),
-
-    # ---------- LTX 2.3 — Kijai's ComfyUI-ready conversion of Lightricks/LTX-2.3 ----------
-    (
-        "Kijai/LTX2.3_comfy",
-        "diffusion_models/ltx-2.3-22b-dev_transformer_only_bf16.safetensors",
-        "diffusion_models",
-        "LTX 2.3 22B Dev DiT (BF16, 42GB — full quality)",
-    ),
-    (
-        "Kijai/LTX2.3_comfy",
-        "diffusion_models/ltx-2.3-22b-dev_transformer_only_fp8_scaled.safetensors",
-        "diffusion_models",
-        "LTX 2.3 22B Dev DiT (FP8 scaled, 23.5GB — fast alt)",
-    ),
-    (
-        "Kijai/LTX2.3_comfy",
-        "text_encoders/ltx-2.3_text_projection_bf16.safetensors",
-        "text_encoders",
-        "LTX 2.3 text projection layer",
-    ),
-    (
-        "Kijai/LTX2.3_comfy",
-        "vae/LTX23_video_vae_bf16.safetensors",
-        "vae",
-        "LTX 2.3 video VAE (BF16)",
-    ),
-    (
-        "Kijai/LTX2.3_comfy",
-        "vae/LTX23_audio_vae_bf16.safetensors",
-        "vae",
-        "LTX 2.3 audio VAE (BF16)",
-    ),
-    (
-        "Kijai/LTX2.3_comfy",
-        "vae/taeltx2_3.safetensors",
-        "vae",
-        "LTX 2.3 tiny preview VAE",
-    ),
-    (
-        "Kijai/LTX2.3_comfy",
-        "loras/ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors",
-        "loras",
-        "LTX 2.3 distilled 1.1 dynamic LoRA (8-step)",
-    ),
-
-    # ---------- Gemma encoder for LTX-2.3 (Comfy-Org split) ----------
-    (
-        "Comfy-Org/ltx-2",
-        "split_files/text_encoders/gemma_3_12B_it.safetensors",
-        "text_encoders",
-        "Gemma-3 12B IT text encoder (BF16, 24.4GB — best quality)",
-    ),
-    (
-        "Comfy-Org/ltx-2",
-        "split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
-        "text_encoders",
-        "Gemma-3 12B IT text encoder (NVFP4 mixed, 9.4GB — sm_121a accelerated)",
-    ),
-
-    # ---------- Abliterated LoRA for Gemma encoder (Comfy-Org/ltx-2) ----------
-    (
-        "Comfy-Org/ltx-2",
-        "split_files/loras/gemma-3-12b-it-abliterated_heretic_lora_rank64_bf16.safetensors",
-        "loras",
-        "Gemma-3 abliterated 'heretic' LoRA (apply on top of Gemma encoder for LTX-2.3)",
-    ),
-    (
-        "Comfy-Org/ltx-2",
-        "split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors",
-        "loras",
-        "Gemma-3 abliterated LoRA (alternate variant)",
-    ),
-
-    # ---------- Canonical-workflow extras (matches Lightricks + Comfy templates) ----------
-    (
-        "Lightricks/LTX-2.3-fp8",
-        "ltx-2.3-22b-dev-fp8.safetensors",
-        "checkpoints",
-        "LTX 2.3 22B Dev FP8 full checkpoint (29GB — used by the canonical T2V/I2V templates)",
-    ),
-    (
-        "Lightricks/LTX-2.3",
-        "ltx-2.3-22b-distilled-lora-384.safetensors",
-        "loras",
-        "LTX 2.3 distilled LoRA-384 (canonical 8-step distilled LoRA, 7.6GB)",
-    ),
-    # VBVR Physics LoRA — required by movie_maker_fast.py fast/quality modes.
-    # Place in ltx2/ subdirectory. ComfyUI registers as: ltx2/Ltx2.3-Licon-VBVR-I2V-96000-R32.safetensors
-    # HuggingFace: https://huggingface.co/LiconStudio/Ltx2.3-VBVR-lora-I2V
-    (
-        "LiconStudio/Ltx2.3-VBVR-lora-I2V",
-        "Ltx2.3-Licon-VBVR-I2V-96000-R32.safetensors",
-        "loras/ltx2",
-        "LTX 2.3 VBVR Physics LoRA (enhances motion dynamics and temporal consistency, 2.9GB)",
-    ),
-    # IC-LoRA Union Control — required by movie_maker_fast.py fast/quality modes.
-    # Enables reference-based video-to-video control.
-    # HuggingFace: https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control
-    (
-        "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control",
-        "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
-        "loras",
-        "LTX 2.3 IC-LoRA Union Control (reference-based video-to-video control, 3.5GB)",
-    ),
-    (
-        "Lightricks/LTX-2.3",
-        "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-        "latent_upscale_models",
-        "LTX 2.3 spatial upscaler x2 v1.1 (canonical 2-stage upscaling)",
-    ),
-    (
-        "Lightricks/LTX-2.3",
-        "ltx-2.3-temporal-upscaler-x2-1.0.safetensors",
-        "latent_upscale_models",
-        "LTX 2.3 temporal upscaler x2 v1.0 (motion smoothing)",
-    ),
-    (
-        "black-forest-labs/FLUX.2-small-decoder",
-        "full_encoder_small_decoder.safetensors",
-        "vae",
-        "Flux 2 full-encoder small-decoder VAE (used by canonical Flux 2 t2i template, 250MB)",
-    ),
-    (
-        "ByteZSzn/Flux.2-Turbo-ComfyUI",
-        "Flux_2-Turbo-LoRA_comfyui.safetensors",
-        "loras",
-        "Flux 2 Turbo LoRA (canonical filename — alternate to Flux2TurboComfyv2.safetensors)",
-    ),
-
-    # ---------- Files referenced by Lightricks's distilled workflows that the
-    #            earlier download set missed (issue caught during workflow validation) ----------
-    (
-        "Lightricks/LTX-2.3",
-        "ltx-2.3-22b-dev.safetensors",
-        "checkpoints",
-        "LTX 2.3 22B Dev BF16 full checkpoint (46GB — Lightricks single-stage distilled workflow)",
-    ),
-    (
-        "Lightricks/LTX-2.3",
-        "ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
-        "loras/ltxv/ltx2",
-        "LTX 2.3 distilled LoRA-384 v1.1 (7.6GB — nested under loras/ltxv/ltx2/ as workflow expects)",
-    ),
-    (
-        "Lightricks/LTX-2.3-fp8",
-        "ltx-2.3-22b-distilled-fp8.safetensors",
-        "checkpoints",
-        "LTX 2.3 22B distilled FP8 checkpoint (29GB — flf2v workflow)",
-    ),
-    (
-        "AviadDahan/LTX-2.3-ID-LoRA-TalkVid-3K",
-        "lora_weights.safetensors",
-        "loras",
-        "LTX 2.3 ID LoRA TalkVid 3K (1.2GB — id_lora workflow)",
-        "ltx-2.3-id-lora-talkvid-3k.safetensors",
-    ),
-    (
-        "Comfy-Org/ltx-2",
-        "split_files/text_encoders/gemma_3_12B_it.safetensors",
-        "text_encoders",
-        "Gemma-3 12B IT under the comfy_-prefixed name Lightricks's distilled workflow expects (BF16, 24.4GB)",
-        "comfy_gemma_3_12B_it.safetensors",
-    ),
-    (
-        "black-forest-labs/FLUX.2-klein-base-9b-fp8",
-        "flux-2-klein-base-9b-fp8.safetensors",
-        "diffusion_models",
-        "Flux 2 Klein base 9B FP8 (9.5GB — Klein 9B workflow)",
-    ),
-    (
-        "Comfy-Org/vae-text-encorder-for-flux-klein-9b",
-        "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors",
-        "text_encoders",
-        "Qwen 3 8B FP8 mixed text encoder for Flux 2 Klein 9B (8.7GB)",
-    ),
-
-    # ---------- LTX 2.3 distilled-1.1 fp8 (kijai/ComfyUI-PromptRelay workflow) ----------
-    (
-        "Kijai/LTX2.3_comfy",
-        "diffusion_models/ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors",
-        "diffusion_models",
-        "LTX 2.3 22B distilled-1.1 transformer-only FP8 scaled (25GB — kijai PromptRelay workflow)",
-    ),
-
-    # ---------- ACE-Step v1.5 audio model (powers the Ancient_Sufi workflow) ----------
-    (
-        "Comfy-Org/ace_step_1.5_ComfyUI_files",
-        "split_files/diffusion_models/acestep_v1.5_xl_turbo_bf16.safetensors",
-        "diffusion_models",
-        "ACE-Step v1.5 XL Turbo DiT (BF16, 9.97GB — Ancient_Sufi workflow)",
-    ),
-    (
-        "Comfy-Org/ace_step_1.5_ComfyUI_files",
-        "split_files/text_encoders/qwen_0.6b_ace15.safetensors",
-        "text_encoders",
-        "ACE-Step v1.5 Qwen 0.6B text encoder (CLIP-A, 1.19GB)",
-    ),
-    (
-        "Comfy-Org/ace_step_1.5_ComfyUI_files",
-        "split_files/text_encoders/qwen_4b_ace15.safetensors",
-        "text_encoders",
-        "ACE-Step v1.5 Qwen 4B text encoder (CLIP-B, 8.38GB)",
-    ),
-    (
-        "Comfy-Org/ace_step_1.5_ComfyUI_files",
-        "split_files/vae/ace_1.5_vae.safetensors",
-        "vae",
-        "ACE-Step v1.5 1D audio VAE (337MB)",
-    ),
-]
-
-# Optional snapshot downloads — full HF-format abliterated LLM weights for
-# users who want to swap in a fully-abliterated text encoder via custom nodes.
-ABLITERATED_SNAPSHOTS: list[tuple[str, str, str, list[str]]] = [
-    # (repo_id, local_subdir under text_encoders/, friendly_name, allow_patterns)
-    (
-        "huihui-ai/Huihui-Mistral-Small-3.2-24B-Instruct-2506-abliterated",
-        "abliterated/Mistral-Small-3.2-24B-abliterated",
-        "Huihui Mistral-Small-3.2 24B abliterated (full HF weights — swap-in alt for Flux 2)",
-        ["*.safetensors", "*.json", "*.model", "tokenizer*", "config*"],
-    ),
-    (
-        "huihui-ai/gemma-3-12b-it-abliterated",
-        "abliterated/Gemma-3-12B-IT-abliterated",
-        "Huihui Gemma-3 12B IT abliterated (full HF weights — swap-in alt for LTX 2.3)",
-        ["*.safetensors", "*.json", "*.model", "tokenizer*", "config*"],
-    ),
-]
+DEFAULT_PROFILE = "legacy"
+DISK_SAFETY_MARGIN_GB = 5.0   # kept free on top of the estimated download size
+SIZE_TOLERANCE = 0.02         # 2% tolerance when comparing on-disk vs remote size
 
 
+# ---------------------------------------------------------------------------
+# Manifest model
+# ---------------------------------------------------------------------------
+@dataclass
+class Entry:
+    dest: str
+    name: str
+    size_gb: float
+    precision: str
+    group: str
+    repo: str | None = None
+    file: str | None = None
+    rename: str | None = None
+    gated: bool = False
+    link_of: str | None = None
+
+    @property
+    def target_name(self) -> str:
+        if self.rename:
+            return self.rename
+        if self.file:
+            return Path(self.file).name
+        return Path(self.link_of or "unknown").name
+
+    def target_path(self, models_dir: Path) -> Path:
+        return models_dir / self.dest / self.target_name
+
+
+@dataclass
+class Snapshot:
+    repo: str
+    dest: str
+    name: str
+    size_gb: float
+    group: str
+    allow_patterns: list[str] = field(default_factory=list)
+
+
+def load_manifest(path: Path) -> tuple[list[Entry], list[Snapshot], dict]:
+    with path.open() as fh:
+        data = yaml.safe_load(fh)
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        raise SystemExit(f"unsupported or missing manifest schema in {path}")
+    entries = [Entry(**e) for e in data.get("entries", [])]
+    snapshots = [Snapshot(**s) for s in data.get("snapshots", [])]
+    profiles = data.get("profiles", {})
+    return entries, snapshots, profiles
+
+
+# ---------------------------------------------------------------------------
+# Selection
+# ---------------------------------------------------------------------------
+def parse_group_mods(spec: str) -> tuple[set[str], set[str]]:
+    """'+wan-video,-ace-audio' -> (add={'wan-video'}, remove={'ace-audio'})"""
+    add, remove = set(), set()
+    for tok in filter(None, (t.strip() for t in spec.split(","))):
+        if tok.startswith("-"):
+            remove.add(tok[1:])
+        else:
+            add.add(tok.lstrip("+"))
+    return add, remove
+
+
+def select(entries: list[Entry], snapshots: list[Snapshot], profiles: dict,
+           profile_name: str, group_spec: str, skip_abliterated: bool
+           ) -> tuple[list[Entry], list[Snapshot], set[str]]:
+    if profile_name not in profiles:
+        raise SystemExit(
+            f"unknown profile '{profile_name}' (available: {', '.join(sorted(profiles))})")
+    prof = profiles[profile_name]
+    groups = set(prof.get("groups", []))
+    excluded_precisions = set(prof.get("exclude_precisions", []))
+
+    add, remove = parse_group_mods(group_spec)
+    groups |= add
+    groups -= remove
+    if skip_abliterated:
+        groups.discard("abliterated")
+
+    picked = [e for e in entries
+              if e.group in groups and e.precision not in excluded_precisions]
+    picked_snaps = [s for s in snapshots if s.group in groups]
+
+    # A hardlink whose source file was excluded by the precision filter can
+    # never be created — drop it and say so.
+    targets = {f"{e.dest}/{e.target_name}" for e in picked if not e.link_of}
+    kept = []
+    for e in picked:
+        if e.link_of and e.link_of not in targets:
+            log.info("~ skipping %s (link source excluded by profile)", e.name)
+            continue
+        kept.append(e)
+    return kept, picked_snaps, groups
+
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+def pending_size_gb(entries: list[Entry], snapshots: list[Snapshot],
+                    models_dir: Path) -> float:
+    total = 0.0
+    for e in entries:
+        if e.link_of:
+            continue
+        p = e.target_path(models_dir)
+        if not (p.exists() and p.stat().st_size > 0):
+            total += e.size_gb
+    for s in snapshots:
+        d = models_dir / "text_encoders" / s.dest
+        if not (d.exists() and any(d.glob("*.safetensors"))):
+            total += s.size_gb
+    return total
+
+
+def preflight_disk(models_dir: Path, needed_gb: float, force: bool) -> None:
+    models_dir.mkdir(parents=True, exist_ok=True)
+    free_gb = shutil.disk_usage(models_dir).free / 1e9
+    required = needed_gb + DISK_SAFETY_MARGIN_GB
+    log.info("preflight: ~%.1f GB to download, %.1f GB free (margin %.0f GB)",
+             needed_gb, free_gb, DISK_SAFETY_MARGIN_GB)
+    if free_gb < required:
+        msg = (f"insufficient disk: need ~{required:.0f} GB free on "
+               f"{models_dir}, have {free_gb:.0f} GB. Free space, choose a "
+               f"smaller profile (MODEL_PROFILE=spark|minimal), or move the "
+               f"workspace (COMFY_WORKSPACE) to a larger volume.")
+        if force:
+            log.warning("%s -- continuing anyway (--force)", msg)
+        else:
+            raise SystemExit(f"[downloader] {msg} (use --force to override)")
+
+
+# ---------------------------------------------------------------------------
+# Fetch / verify / link
+# ---------------------------------------------------------------------------
 def _retry(callable_, *, attempts: int = 4, base_delay: float = 5.0):
     last = None
     for i in range(attempts):
@@ -302,34 +209,64 @@ def _retry(callable_, *, attempts: int = 4, base_delay: float = 5.0):
         except (HfHubHTTPError, ConnectionError, OSError) as e:
             last = e
             wait = base_delay * (2 ** i)
-            log.warning("attempt %d/%d failed (%s); retrying in %.0fs", i + 1, attempts, e, wait)
+            log.warning("attempt %d/%d failed (%s); retrying in %.0fs",
+                        i + 1, attempts, e, wait)
             time.sleep(wait)
     raise last  # type: ignore[misc]
 
 
-def fetch_file(repo_id: str, repo_path: str, dst_dir: Path, friendly: str,
-               token: str | None, local_filename: str | None = None) -> bool:
-    """Download a single file from HF.
+def remote_size(entry: Entry, token: str | None) -> int | None:
+    """Size in bytes from HF metadata, or None if unavailable."""
+    try:
+        url = hf_hub_url(repo_id=entry.repo, filename=entry.file)
+        meta = get_hf_file_metadata(url, token=token)
+        return meta.size
+    except Exception:
+        return None
 
-    Args:
-        repo_id, repo_path: where the file lives on HF
-        dst_dir: target directory (already includes nested subdirs from the entry's local_subdir)
-        friendly: human label for logs
-        local_filename: if provided, the file is saved under this name (renames the HF basename)
-    """
-    target_name = local_filename or Path(repo_path).name
-    final_path = dst_dir / target_name
+
+def verify_size(path: Path, expected: int | None, friendly: str) -> bool:
+    if expected is None:
+        return True  # metadata unavailable; don't fail the download over it
+    actual = path.stat().st_size
+    if abs(actual - expected) <= expected * SIZE_TOLERANCE:
+        return True
+    log.error("✗ size mismatch for %s: on disk %d bytes, HF reports %d — "
+              "removing corrupt file", friendly, actual, expected)
+    path.unlink(missing_ok=True)
+    return False
+
+
+def fetch_entry(entry: Entry, models_dir: Path, token: str | None) -> bool:
+    dst_dir = models_dir / entry.dest
+    final_path = entry.target_path(models_dir)
+
     if final_path.exists() and final_path.stat().st_size > 0:
-        log.info("✓ already present: %s", friendly)
+        log.info("✓ already present: %s", entry.name)
         return True
 
-    log.info("⤓ %s  (%s :: %s%s)", friendly, repo_id, repo_path,
-             f"  → renamed to {target_name}" if local_filename else "")
+    # Hardlink entries: link to an already-downloaded sibling.
+    if entry.link_of:
+        src = models_dir / entry.link_of
+        if not (src.exists() and src.stat().st_size > 0):
+            log.error("✗ link source missing for %s (%s)", entry.name, src)
+            return False
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(src, final_path)
+            log.info("✓ hardlinked: %s -> %s", entry.name, final_path)
+        except OSError:
+            shutil.copy2(src, final_path)
+            log.info("✓ copied (fs does not support hardlinks): %s", entry.name)
+        return True
+
+    log.info("⤓ %s  (%s :: %s%s)", entry.name, entry.repo, entry.file,
+             f"  → renamed to {entry.target_name}" if entry.rename else "")
     dst_dir.mkdir(parents=True, exist_ok=True)
     try:
         out = _retry(lambda: hf_hub_download(
-            repo_id=repo_id,
-            filename=repo_path,
+            repo_id=entry.repo,
+            filename=entry.file,
             local_dir=str(dst_dir),
             token=token,
         ))
@@ -340,10 +277,8 @@ def fetch_file(repo_id: str, repo_path: str, dst_dir: Path, friendly: str,
             try:
                 out_path.replace(final_path)
             except OSError:
-                import shutil
                 shutil.copy2(out_path, final_path)
                 out_path.unlink(missing_ok=True)
-            # Clean empty parent dirs left behind
             try:
                 parent = out_path.parent
                 while parent != dst_dir and not any(parent.iterdir()):
@@ -351,68 +286,176 @@ def fetch_file(repo_id: str, repo_path: str, dst_dir: Path, friendly: str,
                     parent = parent.parent
             except OSError:
                 pass
-        log.info("✓ done: %s -> %s", friendly, final_path)
+        if not verify_size(final_path, remote_size(entry, token), entry.name):
+            return False
+        log.info("✓ done: %s -> %s", entry.name, final_path)
         return True
     except Exception as e:
-        log.error("✗ failed: %s (%s)", friendly, e)
+        hint = " (gated repo — accept the licence on HF and set HF_TOKEN)" \
+            if entry.gated and "403" in str(e) else ""
+        log.error("✗ failed: %s (%s)%s", entry.name, e, hint)
         return False
 
 
-def fetch_snapshot(repo_id: str, dst_dir: Path, friendly: str, allow: Iterable[str], token: str | None) -> bool:
+def fetch_snapshot(s: Snapshot, models_dir: Path, token: str | None) -> bool:
+    dst_dir = models_dir / "text_encoders" / s.dest
     if dst_dir.exists() and any(dst_dir.glob("*.safetensors")):
-        log.info("✓ snapshot already present: %s", friendly)
+        log.info("✓ snapshot already present: %s", s.name)
         return True
-    log.info("⤓ snapshot %s  (%s)", friendly, repo_id)
+    log.info("⤓ snapshot %s  (%s)", s.name, s.repo)
     dst_dir.mkdir(parents=True, exist_ok=True)
     try:
         _retry(lambda: snapshot_download(
-            repo_id=repo_id,
+            repo_id=s.repo,
             local_dir=str(dst_dir),
-            allow_patterns=list(allow),
+            allow_patterns=list(s.allow_patterns),
             token=token,
         ))
-        log.info("✓ done snapshot: %s -> %s", friendly, dst_dir)
+        log.info("✓ done snapshot: %s -> %s", s.name, dst_dir)
         return True
     except Exception as e:
-        log.error("✗ snapshot failed: %s (%s)", friendly, e)
+        log.error("✗ snapshot failed: %s (%s)", s.name, e)
         return False
 
 
+# ---------------------------------------------------------------------------
+# Reporting modes
+# ---------------------------------------------------------------------------
+def print_plan(entries: list[Entry], snapshots: list[Snapshot],
+               models_dir: Path, profile: str, groups: set[str]) -> None:
+    by_group: dict[str, float] = {}
+    log.info("profile: %s   groups: %s", profile, ", ".join(sorted(groups)))
+    for e in entries:
+        p = e.target_path(models_dir)
+        state = "present" if p.exists() and p.stat().st_size > 0 else \
+                ("link" if e.link_of else "fetch")
+        log.info("  [%-7s] %-11s %5.1f GB  %s", state, e.group, e.size_gb, e.name)
+        if state == "fetch":
+            by_group[e.group] = by_group.get(e.group, 0.0) + e.size_gb
+    for s in snapshots:
+        d = models_dir / "text_encoders" / s.dest
+        state = "present" if d.exists() and any(d.glob("*.safetensors")) else "fetch"
+        log.info("  [%-7s] %-11s %5.1f GB  %s", state, s.group, s.size_gb, s.name)
+        if state == "fetch":
+            by_group[s.group] = by_group.get(s.group, 0.0) + s.size_gb
+    log.info("-" * 60)
+    for g in sorted(by_group):
+        log.info("  to fetch — %-12s %6.1f GB", g, by_group[g])
+    log.info("  to fetch — TOTAL        %6.1f GB", sum(by_group.values()))
+
+
+def validate(entries: list[Entry], token: str | None) -> int:
+    """Metadata-only existence/size check. Returns number of failures."""
+    failures = 0
+    for e in entries:
+        if e.link_of:
+            continue
+        size = remote_size(e, token)
+        if size is None:
+            log.error("✗ NOT FOUND on HF: %s  (%s :: %s)", e.name, e.repo, e.file)
+            failures += 1
+        else:
+            drift = ""
+            if e.size_gb and abs(size / 1e9 - e.size_gb) > max(1.0, e.size_gb * 0.25):
+                drift = f"  [manifest says {e.size_gb:.1f} GB — update size_gb]"
+            log.info("✓ %s — %.2f GB on HF%s", e.name, size / 1e9, drift)
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--workspace", required=True, help="Persistent workspace root (parent of models/)")
-    parser.add_argument("--skip-abliterated", action="store_true", help="Skip downloading full abliterated LLM snapshots")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--workspace", required=True,
+                        help="Persistent workspace root (parent of models/)")
+    parser.add_argument("--manifest", default=None,
+                        help="Path to models.yaml (default: next to this script, "
+                             "then <workspace>/models.yaml)")
+    parser.add_argument("--profile", default=os.environ.get("MODEL_PROFILE", DEFAULT_PROFILE),
+                        help=f"Selection profile (default: env MODEL_PROFILE or '{DEFAULT_PROFILE}')")
+    parser.add_argument("--groups", default=os.environ.get("MODEL_GROUPS", ""),
+                        help="Comma-separated group modifiers, e.g. '+wan-video,-ace-audio' "
+                             "(default: env MODEL_GROUPS)")
+    parser.add_argument("--skip-abliterated", action="store_true",
+                        help="Skip the abliterated LLM snapshots (back-compat)")
+    parser.add_argument("--list", action="store_true",
+                        help="Show the selection plan with sizes and exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Alias for --list")
+    parser.add_argument("--validate", action="store_true",
+                        help="Check selected entries exist on HF (metadata only) and exit")
+    parser.add_argument("--force", action="store_true",
+                        help="Proceed even if the preflight disk check fails")
     args = parser.parse_args()
 
     ws = Path(args.workspace)
-    models = ws / "models"
+    models_dir = ws / "models"
+
+    manifest_path = None
+    for candidate in ([Path(args.manifest)] if args.manifest else
+                      [Path(__file__).parent / "models.yaml", ws / "models.yaml"]):
+        if candidate.exists():
+            manifest_path = candidate
+            break
+    if manifest_path is None:
+        log.error("models.yaml not found (looked next to the script and in the workspace)")
+        return 2
+    log.info("manifest: %s", manifest_path)
+
+    entries, snapshots, profiles = load_manifest(manifest_path)
+
+    skip_abl = args.skip_abliterated or os.environ.get("SKIP_ABLITERATED", "0") == "1"
+    sel_entries, sel_snaps, groups = select(
+        entries, snapshots, profiles, args.profile, args.groups, skip_abl)
+
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if token:
         log.info("HF token detected — gated repos accessible")
     else:
-        log.warning("no HF_TOKEN set — gated repos (e.g. FLUX.2-dev source) may be inaccessible")
+        log.warning("no HF_TOKEN set — gated repos (FLUX.2-dev, Klein, Gemma) may fail")
 
-    successes = 0
-    failures = 0
+    if args.list or args.dry_run:
+        print_plan(sel_entries, sel_snaps, models_dir, args.profile, groups)
+        return 0
 
-    # 1. Primary file-by-file downloads
-    for entry in PRIMARY_FILES:
-        # Backwards compatible: 4-tuple (canonical) or 5-tuple (with rename)
-        if len(entry) == 5:
-            repo_id, repo_path, subdir, friendly, local_filename = entry
-        else:
-            repo_id, repo_path, subdir, friendly = entry
-            local_filename = None
-        ok = fetch_file(repo_id, repo_path, models / subdir, friendly, token, local_filename)
+    if args.validate:
+        failures = validate(sel_entries, token)
+        log.info("validate: %d entries checked, %d missing",
+                 len([e for e in sel_entries if not e.link_of]), failures)
+        return 0 if failures == 0 else 1
+
+    needed = pending_size_gb(sel_entries, sel_snaps, models_dir)
+    preflight_disk(models_dir, needed, args.force)
+
+    status: dict = {"profile": args.profile, "groups": sorted(groups),
+                    "manifest": str(manifest_path), "entries": []}
+    successes = failures = 0
+
+    # Non-link entries first so hardlink sources exist before links are made.
+    for e in sorted(sel_entries, key=lambda x: bool(x.link_of)):
+        ok = fetch_entry(e, models_dir, token)
         successes += int(ok)
         failures += int(not ok)
+        status["entries"].append({
+            "name": e.name, "group": e.group,
+            "path": str(e.target_path(models_dir)), "ok": ok,
+        })
 
-    # 2. Optional abliterated snapshots
-    if not args.skip_abliterated and os.environ.get("SKIP_ABLITERATED", "0") != "1":
-        for repo_id, subdir, friendly, allow in ABLITERATED_SNAPSHOTS:
-            ok = fetch_snapshot(repo_id, models / "text_encoders" / subdir, friendly, allow, token)
-            successes += int(ok)
-            failures += int(not ok)
+    for s in sel_snaps:
+        ok = fetch_snapshot(s, models_dir, token)
+        successes += int(ok)
+        failures += int(not ok)
+        status["entries"].append({"name": s.name, "group": s.group,
+                                  "snapshot": True, "ok": ok})
+
+    status["ok"] = successes
+    status["failed"] = failures
+    try:
+        (ws / "manifest_status.json").write_text(json.dumps(status, indent=2))
+    except OSError as e:
+        log.warning("could not write manifest_status.json (%s)", e)
 
     log.info("=" * 60)
     log.info("download summary: %d ok, %d failed", successes, failures)

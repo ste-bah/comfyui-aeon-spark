@@ -1,0 +1,491 @@
+# =============================================================================
+# models.yaml — model manifest for download_models.py
+# =============================================================================
+# Each entry:
+#   repo:      HF repo id
+#   file:      path inside the repo
+#   dest:      subdir under <workspace>/models/ (may be nested)
+#   name:      human label for logs
+#   size_gb:   approximate download size (used for the preflight disk check;
+#              exact size is verified against HF metadata after download)
+#   precision: bf16 | fp8 | nvfp4 | misc   (misc = only variant / always kept)
+#   group:     logical bundle, selectable per profile
+#   rename:    optional — save under this filename instead of the HF basename
+#   gated:     optional — requires an accepted HF licence + HF_TOKEN
+#   link_of:   optional — do NOT download; hardlink to another entry's output,
+#              given as "<dest>/<filename>". Saves disk + bandwidth for files
+#              that workflows expect under two names.
+#
+# Profiles (select with MODEL_PROFILE env or --profile):
+#   legacy  : exact parity with the original 35-item download set (default)
+#   spark   : DGX Spark optimal — NVFP4/FP8 first, no BF16 twins, adds the
+#             2026 image models (Z-Image-Turbo, Qwen-Image family)
+#   latest  : legacy + the 2026 additions, all precisions
+#   minimal : one model per modality, smallest sensible footprint
+#
+# Groups can be added/removed on top of a profile:
+#   MODEL_GROUPS="+wan-video,-ace-audio"   (or --groups)
+# =============================================================================
+
+schema: 1
+
+profiles:
+  legacy:
+    groups: [flux2-image, flux2-klein, ltx-video, ace-audio, abliterated]
+    exclude_precisions: []
+  spark:
+    groups: [flux2-image, flux2-klein, ltx-video, ace-audio, z-image, qwen-image]
+    exclude_precisions: [bf16]
+  latest:
+    groups: [flux2-image, flux2-klein, ltx-video, ace-audio, abliterated, z-image, qwen-image]
+    exclude_precisions: []
+  minimal:
+    groups: [z-image, ace-audio]
+    exclude_precisions: [bf16]
+
+entries:
+  # ---------------------------------------------------------------------------
+  # Flux 2 Dev (Comfy-Org pre-split, ComfyUI-native)
+  # ---------------------------------------------------------------------------
+  - repo: Comfy-Org/flux2-dev
+    file: split_files/diffusion_models/flux2_dev_fp8mixed.safetensors
+    dest: diffusion_models
+    name: "Flux 2 Dev DiT (fp8 mixed)"
+    size_gb: 35.5
+    precision: fp8
+    group: flux2-image
+    gated: true
+
+  - repo: Comfy-Org/flux2-dev
+    file: split_files/vae/flux2-vae.safetensors
+    dest: vae
+    name: "Flux 2 VAE"
+    size_gb: 0.4
+    precision: misc
+    group: flux2-image
+
+  - repo: Comfy-Org/flux2-dev
+    file: split_files/text_encoders/mistral_3_small_flux2_bf16.safetensors
+    dest: text_encoders
+    name: "Flux 2 Mistral-3 Small text encoder (BF16 — best quality)"
+    size_gb: 35.6
+    precision: bf16
+    group: flux2-image
+
+  - repo: Comfy-Org/flux2-dev
+    file: split_files/text_encoders/mistral_3_small_flux2_fp4_mixed.safetensors
+    dest: text_encoders
+    name: "Flux 2 Mistral-3 Small text encoder (NVFP4 mixed — sm_121a accelerated)"
+    size_gb: 12.3
+    precision: nvfp4
+    group: flux2-image
+
+  - repo: Comfy-Org/flux2-dev
+    file: split_files/loras/Flux2TurboComfyv2.safetensors
+    dest: loras
+    name: "Flux 2 Turbo LoRA (fewer-step inference)"
+    size_gb: 0.7
+    precision: misc
+    group: flux2-image
+
+  - repo: black-forest-labs/FLUX.2-small-decoder
+    file: full_encoder_small_decoder.safetensors
+    dest: vae
+    name: "Flux 2 full-encoder small-decoder VAE (canonical t2i template)"
+    size_gb: 0.25
+    precision: misc
+    group: flux2-image
+    gated: true
+
+  - repo: ByteZSzn/Flux.2-Turbo-ComfyUI
+    file: Flux_2-Turbo-LoRA_comfyui.safetensors
+    dest: loras
+    name: "Flux 2 Turbo LoRA (canonical filename variant)"
+    size_gb: 0.7
+    precision: misc
+    group: flux2-image
+
+  # ---------------------------------------------------------------------------
+  # Flux 2 Klein 9B (separate group — gated, single workflow)
+  # ---------------------------------------------------------------------------
+  - repo: black-forest-labs/FLUX.2-klein-base-9b-fp8
+    file: flux-2-klein-base-9b-fp8.safetensors
+    dest: diffusion_models
+    name: "Flux 2 Klein base 9B FP8 (Klein workflow)"
+    size_gb: 9.5
+    precision: fp8
+    group: flux2-klein
+    gated: true
+
+  - repo: Comfy-Org/vae-text-encorder-for-flux-klein-9b
+    file: split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors
+    dest: text_encoders
+    name: "Qwen 3 8B FP8 mixed text encoder for Klein 9B"
+    size_gb: 8.7
+    precision: fp8
+    group: flux2-klein
+
+  # ---------------------------------------------------------------------------
+  # LTX 2.3 — Kijai's ComfyUI-ready conversion + Lightricks canonical files
+  # ---------------------------------------------------------------------------
+  - repo: Kijai/LTX2.3_comfy
+    file: diffusion_models/ltx-2.3-22b-dev_transformer_only_bf16.safetensors
+    dest: diffusion_models
+    name: "LTX 2.3 22B Dev DiT (BF16 — full quality)"
+    size_gb: 42.0
+    precision: bf16
+    group: ltx-video
+
+  - repo: Kijai/LTX2.3_comfy
+    file: diffusion_models/ltx-2.3-22b-dev_transformer_only_fp8_scaled.safetensors
+    dest: diffusion_models
+    name: "LTX 2.3 22B Dev DiT (FP8 scaled — fast)"
+    size_gb: 23.5
+    precision: fp8
+    group: ltx-video
+
+  - repo: Kijai/LTX2.3_comfy
+    file: diffusion_models/ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors
+    dest: diffusion_models
+    name: "LTX 2.3 22B distilled-1.1 transformer-only FP8 scaled (PromptRelay workflow)"
+    size_gb: 25.0
+    precision: fp8
+    group: ltx-video
+
+  - repo: Kijai/LTX2.3_comfy
+    file: text_encoders/ltx-2.3_text_projection_bf16.safetensors
+    dest: text_encoders
+    name: "LTX 2.3 text projection layer"
+    size_gb: 0.5
+    precision: misc
+    group: ltx-video
+
+  - repo: Kijai/LTX2.3_comfy
+    file: vae/LTX23_video_vae_bf16.safetensors
+    dest: vae
+    name: "LTX 2.3 video VAE"
+    size_gb: 1.5
+    precision: misc
+    group: ltx-video
+
+  - repo: Kijai/LTX2.3_comfy
+    file: vae/LTX23_audio_vae_bf16.safetensors
+    dest: vae
+    name: "LTX 2.3 audio VAE"
+    size_gb: 0.5
+    precision: misc
+    group: ltx-video
+
+  - repo: Kijai/LTX2.3_comfy
+    file: vae/taeltx2_3.safetensors
+    dest: vae
+    name: "LTX 2.3 tiny preview VAE"
+    size_gb: 0.1
+    precision: misc
+    group: ltx-video
+
+  - repo: Kijai/LTX2.3_comfy
+    file: loras/ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors
+    dest: loras
+    name: "LTX 2.3 distilled 1.1 dynamic LoRA (8-step)"
+    size_gb: 2.0
+    precision: misc
+    group: ltx-video
+
+  - repo: Lightricks/LTX-2.3-fp8
+    file: ltx-2.3-22b-dev-fp8.safetensors
+    dest: checkpoints
+    name: "LTX 2.3 22B Dev FP8 full checkpoint (canonical T2V/I2V templates)"
+    size_gb: 29.0
+    precision: fp8
+    group: ltx-video
+
+  - repo: Lightricks/LTX-2.3-fp8
+    file: ltx-2.3-22b-distilled-fp8.safetensors
+    dest: checkpoints
+    name: "LTX 2.3 22B distilled FP8 checkpoint (flf2v workflow)"
+    size_gb: 29.0
+    precision: fp8
+    group: ltx-video
+
+  - repo: Lightricks/LTX-2.3
+    file: ltx-2.3-22b-dev.safetensors
+    dest: checkpoints
+    name: "LTX 2.3 22B Dev BF16 full checkpoint (single-stage distilled workflow)"
+    size_gb: 46.0
+    precision: bf16
+    group: ltx-video
+
+  - repo: Lightricks/LTX-2.3
+    file: ltx-2.3-22b-distilled-lora-384.safetensors
+    dest: loras
+    name: "LTX 2.3 distilled LoRA-384 (canonical 8-step)"
+    size_gb: 7.6
+    precision: misc
+    group: ltx-video
+
+  - repo: Lightricks/LTX-2.3
+    file: ltx-2.3-22b-distilled-lora-384-1.1.safetensors
+    dest: loras/ltxv/ltx2
+    name: "LTX 2.3 distilled LoRA-384 v1.1 (nested path the workflow expects)"
+    size_gb: 7.6
+    precision: misc
+    group: ltx-video
+
+  - repo: LiconStudio/Ltx2.3-VBVR-lora-I2V
+    file: Ltx2.3-Licon-VBVR-I2V-96000-R32.safetensors
+    dest: loras/ltx2
+    name: "LTX 2.3 VBVR Physics LoRA (motion dynamics / temporal consistency)"
+    size_gb: 2.9
+    precision: misc
+    group: ltx-video
+
+  - repo: Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control
+    file: ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors
+    dest: loras
+    name: "LTX 2.3 IC-LoRA Union Control (reference-based v2v control)"
+    size_gb: 3.5
+    precision: misc
+    group: ltx-video
+
+  - repo: Lightricks/LTX-2.3
+    file: ltx-2.3-spatial-upscaler-x2-1.1.safetensors
+    dest: latent_upscale_models
+    name: "LTX 2.3 spatial upscaler x2 v1.1"
+    size_gb: 1.0
+    precision: misc
+    group: ltx-video
+
+  - repo: Lightricks/LTX-2.3
+    file: ltx-2.3-temporal-upscaler-x2-1.0.safetensors
+    dest: latent_upscale_models
+    name: "LTX 2.3 temporal upscaler x2 v1.0"
+    size_gb: 1.0
+    precision: misc
+    group: ltx-video
+
+  - repo: AviadDahan/LTX-2.3-ID-LoRA-TalkVid-3K
+    file: lora_weights.safetensors
+    dest: loras
+    name: "LTX 2.3 ID LoRA TalkVid 3K (id_lora workflow)"
+    size_gb: 1.2
+    precision: misc
+    group: ltx-video
+    rename: ltx-2.3-id-lora-talkvid-3k.safetensors
+
+  # --- Gemma encoder for LTX 2.3 (Comfy-Org split) ---
+  - repo: Comfy-Org/ltx-2
+    file: split_files/text_encoders/gemma_3_12B_it.safetensors
+    dest: text_encoders
+    name: "Gemma-3 12B IT text encoder (BF16 — best quality)"
+    size_gb: 24.4
+    precision: bf16
+    group: ltx-video
+    gated: true
+
+  # Duplicate name the Lightricks distilled workflow expects — hardlinked to
+  # the file above instead of downloading a second 24.4 GB copy.
+  - link_of: text_encoders/gemma_3_12B_it.safetensors
+    dest: text_encoders
+    name: "Gemma-3 12B IT under the comfy_-prefixed name (hardlink, 0 bytes)"
+    size_gb: 0.0
+    precision: bf16
+    group: ltx-video
+    rename: comfy_gemma_3_12B_it.safetensors
+
+  - repo: Comfy-Org/ltx-2
+    file: split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors
+    dest: text_encoders
+    name: "Gemma-3 12B IT text encoder (NVFP4 mixed — sm_121a accelerated)"
+    size_gb: 9.4
+    precision: nvfp4
+    group: ltx-video
+    gated: true
+
+  - repo: Comfy-Org/ltx-2
+    file: split_files/loras/gemma-3-12b-it-abliterated_heretic_lora_rank64_bf16.safetensors
+    dest: loras
+    name: "Gemma-3 abliterated 'heretic' LoRA (for LTX 2.3 encoder)"
+    size_gb: 0.4
+    precision: misc
+    group: ltx-video
+
+  - repo: Comfy-Org/ltx-2
+    file: split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors
+    dest: loras
+    name: "Gemma-3 abliterated LoRA (alternate variant)"
+    size_gb: 0.4
+    precision: misc
+    group: ltx-video
+
+  # ---------------------------------------------------------------------------
+  # ACE-Step v1.5 audio
+  # ---------------------------------------------------------------------------
+  - repo: Comfy-Org/ace_step_1.5_ComfyUI_files
+    file: split_files/diffusion_models/acestep_v1.5_xl_turbo_bf16.safetensors
+    dest: diffusion_models
+    name: "ACE-Step v1.5 XL Turbo DiT"
+    size_gb: 10.0
+    precision: misc
+    group: ace-audio
+
+  - repo: Comfy-Org/ace_step_1.5_ComfyUI_files
+    file: split_files/text_encoders/qwen_0.6b_ace15.safetensors
+    dest: text_encoders
+    name: "ACE-Step v1.5 Qwen 0.6B text encoder (CLIP-A)"
+    size_gb: 1.19
+    precision: misc
+    group: ace-audio
+
+  - repo: Comfy-Org/ace_step_1.5_ComfyUI_files
+    file: split_files/text_encoders/qwen_4b_ace15.safetensors
+    dest: text_encoders
+    name: "ACE-Step v1.5 Qwen 4B text encoder (CLIP-B)"
+    size_gb: 8.38
+    precision: misc
+    group: ace-audio
+
+  - repo: Comfy-Org/ace_step_1.5_ComfyUI_files
+    file: split_files/vae/ace_1.5_vae.safetensors
+    dest: vae
+    name: "ACE-Step v1.5 1D audio VAE"
+    size_gb: 0.34
+    precision: misc
+    group: ace-audio
+
+  # ---------------------------------------------------------------------------
+  # NEW (2026) — Z-Image-Turbo, 6B S3-DiT, Apache 2.0
+  # 8-step distilled; NVFP4 build available = ideal for the Spark's sm_121a path
+  # ---------------------------------------------------------------------------
+  - repo: Comfy-Org/z_image_turbo
+    file: split_files/diffusion_models/z_image_turbo_nvfp4.safetensors
+    dest: diffusion_models
+    name: "Z-Image-Turbo 6B DiT (NVFP4 — sm_121a accelerated, 8-step)"
+    size_gb: 4.0
+    precision: nvfp4
+    group: z-image
+
+  - repo: Comfy-Org/z_image_turbo
+    file: split_files/diffusion_models/z_image_turbo_bf16.safetensors
+    dest: diffusion_models
+    name: "Z-Image-Turbo 6B DiT (BF16 — reference quality)"
+    size_gb: 12.0
+    precision: bf16
+    group: z-image
+
+  - repo: Comfy-Org/z_image_turbo
+    file: split_files/text_encoders/qwen_3_4b.safetensors
+    dest: text_encoders
+    name: "Z-Image Qwen-3 4B text encoder"
+    size_gb: 8.04
+    precision: misc
+    group: z-image
+
+  - repo: Comfy-Org/z_image_turbo
+    file: split_files/vae/ae.safetensors
+    dest: vae
+    name: "Z-Image VAE (Flux-1 lineage ae)"
+    size_gb: 0.34
+    precision: misc
+    group: z-image
+
+  # ---------------------------------------------------------------------------
+  # NEW (2026) — Qwen-Image 20B MMDiT + Lightning distills + Edit-2509
+  # Apache 2.0; best-in-class typography and instruction-based editing
+  # ---------------------------------------------------------------------------
+  - repo: Comfy-Org/Qwen-Image_ComfyUI
+    file: split_files/diffusion_models/qwen_image_fp8_e4m3fn.safetensors
+    dest: diffusion_models
+    name: "Qwen-Image 20B MMDiT (FP8 e4m3fn)"
+    size_gb: 20.4
+    precision: fp8
+    group: qwen-image
+
+  - repo: Comfy-Org/Qwen-Image_ComfyUI
+    file: split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors
+    dest: text_encoders
+    name: "Qwen 2.5-VL 7B text encoder (FP8 scaled)"
+    size_gb: 9.0
+    precision: fp8
+    group: qwen-image
+
+  - repo: Comfy-Org/Qwen-Image_ComfyUI
+    file: split_files/vae/qwen_image_vae.safetensors
+    dest: vae
+    name: "Qwen-Image VAE"
+    size_gb: 0.25
+    precision: misc
+    group: qwen-image
+
+  - repo: lightx2v/Qwen-Image-Lightning
+    file: Qwen-Image-Lightning-8steps-V1.1.safetensors
+    dest: loras
+    name: "Qwen-Image Lightning 8-step LoRA v1.1 (12-25x speedup)"
+    size_gb: 0.85
+    precision: misc
+    group: qwen-image
+
+  - repo: Comfy-Org/Qwen-Image-Edit_ComfyUI
+    file: split_files/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors
+    dest: diffusion_models
+    name: "Qwen-Image-Edit 2509 (FP8 e4m3fn — multi-image instruction editing)"
+    size_gb: 20.4
+    precision: fp8
+    group: qwen-image
+
+  # ---------------------------------------------------------------------------
+  # EXPERIMENTAL (2026) — Wan 2.2 A14B MoE video (T2V/I2V)
+  # Not in any profile by default. Enable with MODEL_GROUPS="+wan-video".
+  # NOTE: file paths below follow Comfy-Org's repackaging convention but have
+  # NOT been byte-verified — run `download_models.py --validate --groups
+  # +wan-video` first; entries that 404 are reported without downloading.
+  # ---------------------------------------------------------------------------
+  - repo: Comfy-Org/Wan_2.2_ComfyUI_Repackaged
+    file: split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors
+    dest: diffusion_models
+    name: "Wan 2.2 I2V high-noise expert 14B (FP8 scaled)"
+    size_gb: 14.5
+    precision: fp8
+    group: wan-video
+
+  - repo: Comfy-Org/Wan_2.2_ComfyUI_Repackaged
+    file: split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors
+    dest: diffusion_models
+    name: "Wan 2.2 I2V low-noise expert 14B (FP8 scaled)"
+    size_gb: 14.5
+    precision: fp8
+    group: wan-video
+
+  - repo: Comfy-Org/Wan_2.2_ComfyUI_Repackaged
+    file: split_files/vae/wan_2.1_vae.safetensors
+    dest: vae
+    name: "Wan 2.1 VAE (used by the 14B experts)"
+    size_gb: 0.3
+    precision: misc
+    group: wan-video
+
+  - repo: Comfy-Org/Wan_2.1_ComfyUI_repackaged
+    file: split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors
+    dest: text_encoders
+    name: "UMT5-XXL text encoder (FP8 scaled) for Wan"
+    size_gb: 6.7
+    precision: fp8
+    group: wan-video
+
+# -----------------------------------------------------------------------------
+# Full-repo snapshots (abliterated swap-in text encoders)
+# -----------------------------------------------------------------------------
+snapshots:
+  - repo: huihui-ai/Huihui-Mistral-Small-3.2-24B-Instruct-2506-abliterated
+    dest: abliterated/Mistral-Small-3.2-24B-abliterated
+    name: "Huihui Mistral-Small-3.2 24B abliterated (swap-in alt for Flux 2)"
+    size_gb: 47.0
+    group: abliterated
+    allow_patterns: ["*.safetensors", "*.json", "*.model", "tokenizer*", "config*"]
+
+  - repo: huihui-ai/gemma-3-12b-it-abliterated
+    dest: abliterated/Gemma-3-12B-IT-abliterated
+    name: "Huihui Gemma-3 12B IT abliterated (swap-in alt for LTX 2.3)"
+    size_gb: 24.0
+    group: abliterated
+    allow_patterns: ["*.safetensors", "*.json", "*.model", "tokenizer*", "config*"]
