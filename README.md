@@ -46,7 +46,7 @@ cd comfyui-aeon-spark
 
 When prompted: paste the HF token from Step 1. Choose `:latest` (default) for auto-download. The script writes `.env` (chmod 600), launches `docker compose up`, and starts the model download.
 
-### Step 4: Wait for first-start download (~45 min, 285 GB)
+### Step 4: Wait for first-start download (size per model profile: spark ≈ 300 GB, legacy ≈ 453 GB)
 
 The container streams its progress to its log:
 
@@ -90,7 +90,7 @@ For deeper agent-level troubleshooting, see [§6 in AGENTS.md](AGENTS.md#6--comm
 
 | Tag | Image size | What's inside | When to use |
 | --- | --- | --- | --- |
-| **`latest`** / `full` / `bf16-flux2-ltx2.3` / `cu130-sm121a` | **17 GB** | code + downloader; on first start the downloader pulls **~285 GB of weights** into your workspace volume using **your HF_TOKEN** | default — you have an HF account, you just want it to work |
+| **`latest`** / `full` / `bf16-flux2-ltx2.3` / `cu130-sm121a` | **17 GB** | code + downloader; on first start the downloader pulls the selected **MODEL_PROFILE**'s weights (~35–515 GB; `spark` ≈ 300 GB, `legacy` ≈ 453 GB) into your workspace volume using **your HF_TOKEN** | default — you have an HF account, you just want it to work |
 | **`slim`** / `base` | **17 GB** | code only, **no auto-download** | when you want to pick every model individually via the in-UI Manager, or when you want full control / fine-grained license consent |
 
 Both variants ship the same code, custom nodes, and workflows. The difference is one runs the bundled downloader on first start; the other waits for you to install models via the UI.
@@ -186,7 +186,7 @@ EOF
 docker compose up -d && docker compose logs -f comfyui
 ```
 
-First start downloads ~285 GB of models. At ~95 MB/s expect ~50 minutes;
+First start downloads the selected model profile (spark ≈ 300 GB, legacy ≈ 453 GB — see models.yaml). At ~95 MB/s expect ~55 min for spark, ~80 min for legacy;
 look for `download summary: 35 ok, 0 failed` then `Launching ComfyUI on
 port 8188`. (If you skipped accepting the BFL Klein license you'll see
 `34 ok, 1 failed` — that's expected; workflow 08 needs Klein, others don't.)
@@ -381,7 +381,7 @@ This image ships **two** independent paths that both route model downloads to th
 | **aeon-server-side-downloads** (in-tree) | JS-only extension that intercepts the new ComfyUI 0.20+ "Workflow Overview → Missing Models → Download" buttons and routes the download server-side via Manager's queue API, so files land in your workspace volume on the **server**, not in your browser on the **client** machine. Critical for remote-accessed Sparks. |
 | **ComfyUI-PromptRelay** (kijai) | Timeline-based per-second prompt control for video — change descriptions throughout the sequence (used by `10_ltx2.3_prompt_relay`). |
 
-### Models auto-downloaded on first start (~285 GB)
+### Models auto-downloaded on first start (per MODEL_PROFILE — see models.yaml; legacy ≈ 453 GB, spark ≈ 300 GB)
 
 #### Flux 2 Dev (Black Forest Labs / Comfy-Org pre-split)
 - DiT (`flux2_dev_fp8mixed.safetensors`, 35.5 GB)
@@ -483,7 +483,7 @@ swap one widget on the loader from e.g.
 
 ```
 workspace/                           ← single host-mounted volume
-├── models/                          ← 285 GB of pre-staged weights
+├── models/                          ← pre-staged weights (size per MODEL_PROFILE)
 │   ├── diffusion_models/            ← Flux 2 + LTX 2.3 + ACE-Step DiTs
 │   ├── checkpoints/                 ← LTX 2.3 FP8 fused checkpoint
 │   ├── text_encoders/               ← Mistral, Gemma, Qwen

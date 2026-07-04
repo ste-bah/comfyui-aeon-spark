@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 import sys
@@ -65,6 +66,97 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "180")
 DEFAULT_PROFILE = "legacy"
 DISK_SAFETY_MARGIN_GB = 5.0   # kept free on top of the estimated download size
 SIZE_TOLERANCE = 0.02         # 2% tolerance when comparing on-disk vs remote size
+
+# Watchdog / progress knobs (seconds). The HF client's own timeout only guards
+# connection setup; a transfer that goes silent mid-stream can hang forever.
+# If no bytes move for STALL_TIMEOUT, the transfer is killed and retried.
+STALL_TIMEOUT = float(os.environ.get("DOWNLOAD_STALL_TIMEOUT", "180"))   # 0 disables
+PROGRESS_INTERVAL = float(os.environ.get("DOWNLOAD_PROGRESS_INTERVAL", "30"))
+_WATCH_POLL = 5.0
+
+
+class DownloadStalled(OSError):
+    """Transfer made no progress for STALL_TIMEOUT seconds (retryable)."""
+
+
+def _hf_cache_dir() -> Path:
+    return Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+
+
+def _tree_bytes(paths: list[Path]) -> int:
+    total = 0
+    for root in paths:
+        try:
+            if not root.exists():
+                continue
+            for f in root.rglob("*"):
+                try:
+                    if f.is_file():
+                        total += f.stat().st_size
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return total
+
+
+def _child_hf_download(repo_id: str, filename: str, local_dir: str,
+                       token: str | None) -> None:  # pragma: no cover (subprocess)
+    hf_hub_download(repo_id=repo_id, filename=filename,
+                    local_dir=local_dir, token=token)
+
+
+def _child_snapshot(repo_id: str, local_dir: str, allow_patterns: list[str],
+                    token: str | None) -> None:  # pragma: no cover (subprocess)
+    snapshot_download(repo_id=repo_id, local_dir=local_dir,
+                      allow_patterns=allow_patterns, token=token)
+
+
+def _run_guarded(target, args: tuple, watch_paths: list[Path], name: str,
+                 expected_gb: float = 0.0) -> None:
+    """Run a download in a subprocess with a stall watchdog + progress log.
+
+    Bytes are measured across watch_paths (destination dir + HF cache, which
+    covers Xet-staged transfers). No byte movement for STALL_TIMEOUT seconds
+    -> the subprocess is killed and DownloadStalled raised, which the retry
+    wrapper treats like any transient failure.
+    """
+    if STALL_TIMEOUT <= 0:
+        target(*args)
+        return
+    proc = multiprocessing.Process(target=target, args=args, daemon=True)
+    proc.start()
+    baseline = _tree_bytes(watch_paths)
+    prev = baseline
+    log_ref = baseline
+    now0 = time.monotonic()
+    last_change = last_log = now0
+    while proc.is_alive():
+        proc.join(timeout=_WATCH_POLL)
+        if not proc.is_alive():
+            break
+        now = time.monotonic()
+        cur = _tree_bytes(watch_paths)
+        if cur != prev:
+            last_change = now
+        prev = cur
+        if now - last_log >= PROGRESS_INTERVAL:
+            done_gb = max(cur - baseline, 0) / 1e9
+            rate_mb = max(cur - log_ref, 0) / max(now - last_log, 1.0) / 1e6
+            pct = f", ~{min(100.0, 100.0 * done_gb / expected_gb):.0f}%" if expected_gb else ""
+            log.info("… %s: %.2f GB transferred%s (%.0f MB/s)", name, done_gb, pct, rate_mb)
+            log_ref, last_log = cur, now
+        if now - last_change > STALL_TIMEOUT:
+            log.warning("no data for %.0fs on %s — killing transfer for retry",
+                        STALL_TIMEOUT, name)
+            proc.terminate()
+            proc.join(10)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(5)
+            raise DownloadStalled(f"transfer stalled: {name}")
+    if proc.exitcode not in (0, None):
+        raise OSError(f"download subprocess for {name} exited with code {proc.exitcode}")
 
 
 # ---------------------------------------------------------------------------
@@ -264,13 +356,15 @@ def fetch_entry(entry: Entry, models_dir: Path, token: str | None) -> bool:
              f"  → renamed to {entry.target_name}" if entry.rename else "")
     dst_dir.mkdir(parents=True, exist_ok=True)
     try:
-        out = _retry(lambda: hf_hub_download(
-            repo_id=entry.repo,
-            filename=entry.file,
-            local_dir=str(dst_dir),
-            token=token,
+        _retry(lambda: _run_guarded(
+            _child_hf_download,
+            (entry.repo, entry.file, str(dst_dir), token),
+            [dst_dir, _hf_cache_dir()],
+            entry.name,
+            entry.size_gb,
         ))
-        out_path = Path(out)
+        # hf_hub_download(local_dir=...) writes to local_dir/<repo filepath>
+        out_path = dst_dir / entry.file
         # Flatten any HF-imposed subfolder (split_files/...) and apply rename
         if out_path != final_path and out_path.exists():
             final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,11 +399,12 @@ def fetch_snapshot(s: Snapshot, models_dir: Path, token: str | None) -> bool:
     log.info("⤓ snapshot %s  (%s)", s.name, s.repo)
     dst_dir.mkdir(parents=True, exist_ok=True)
     try:
-        _retry(lambda: snapshot_download(
-            repo_id=s.repo,
-            local_dir=str(dst_dir),
-            allow_patterns=list(s.allow_patterns),
-            token=token,
+        _retry(lambda: _run_guarded(
+            _child_snapshot,
+            (s.repo, str(dst_dir), list(s.allow_patterns), token),
+            [dst_dir, _hf_cache_dir()],
+            s.name,
+            s.size_gb,
         ))
         log.info("✓ done snapshot: %s -> %s", s.name, dst_dir)
         return True
@@ -322,9 +417,8 @@ def fetch_snapshot(s: Snapshot, models_dir: Path, token: str | None) -> bool:
 # Reporting modes
 # ---------------------------------------------------------------------------
 def print_plan(entries: list[Entry], snapshots: list[Snapshot],
-               models_dir: Path, profile: str, groups: set[str]) -> None:
+               models_dir: Path) -> None:
     by_group: dict[str, float] = {}
-    log.info("profile: %s   groups: %s", profile, ", ".join(sorted(groups)))
     for e in entries:
         p = e.target_path(models_dir)
         state = "present" if p.exists() and p.stat().st_size > 0 else \
@@ -409,6 +503,11 @@ def main() -> int:
     skip_abl = args.skip_abliterated or os.environ.get("SKIP_ABLITERATED", "0") == "1"
     sel_entries, sel_snaps, groups = select(
         entries, snapshots, profiles, args.profile, args.groups, skip_abl)
+    log.info("profile: %s   groups: %s", args.profile, ", ".join(sorted(groups)))
+    if STALL_TIMEOUT > 0:
+        log.info("stall watchdog: %.0fs, progress every %.0fs "
+                 "(DOWNLOAD_STALL_TIMEOUT / DOWNLOAD_PROGRESS_INTERVAL to tune)",
+                 STALL_TIMEOUT, PROGRESS_INTERVAL)
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if token:
@@ -417,7 +516,7 @@ def main() -> int:
         log.warning("no HF_TOKEN set — gated repos (FLUX.2-dev, Klein, Gemma) may fail")
 
     if args.list or args.dry_run:
-        print_plan(sel_entries, sel_snaps, models_dir, args.profile, groups)
+        print_plan(sel_entries, sel_snaps, models_dir)
         return 0
 
     if args.validate:
